@@ -43,10 +43,10 @@
                                 </StackPanel>
                             </Button>
                             <Button x:Name="InitializeButton" Grid.Column="3" Click="InitializeAndOpen_Click" Style="{StaticResource AccentButtonStyle}"
-                                    Height="42" MinWidth="270" HorizontalAlignment="Right" ToolTipService.ToolTip="初始化并启动 ETS，然后切换到程序预览">
+                                    Height="42" MinWidth="190" HorizontalAlignment="Right" ToolTipService.ToolTip="初始化并启动 ETS">
                                 <StackPanel Orientation="Horizontal" Spacing="7">
                                     <FontIcon Glyph="&#xE768;" FontSize="16" />
-                                    <TextBlock Text="初始化、启动并切换到程序预览" />
+                                    <TextBlock Text="初始化并启动" />
                                 </StackPanel>
                             </Button>
                         </Grid>

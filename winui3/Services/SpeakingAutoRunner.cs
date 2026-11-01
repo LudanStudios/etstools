@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 
 namespace ETSAssistant.WinUI3.Services;
 
@@ -42,6 +43,7 @@ public sealed class SpeakingAutoRunner
             error = $"找不到口语会话：{sessionPath}";
             return false;
         }
+        if (!HasUsableAudio(sessionPath, out error)) return false;
 
         string logPath = Path.Combine(dataRoot, "ets_speaking_auto.log");
         int existingLineCount = 0;
@@ -98,6 +100,36 @@ public sealed class SpeakingAutoRunner
         {
             process.Dispose();
             error = ex.Message;
+            return false;
+        }
+    }
+
+    public static bool HasUsableAudio(string sessionPath, out string error)
+    {
+        error = string.Empty;
+        try
+        {
+            SpeakingSession? session = JsonSerializer.Deserialize<SpeakingSession>(File.ReadAllText(sessionPath));
+            if (session?.Items is not { Count: > 0 })
+            {
+                error = "口语会话中没有可播放的音频。已取消自动录音，请重新生成口语音频。";
+                return false;
+            }
+
+            for (int index = 0; index < session.Items.Count; index++)
+            {
+                string path = session.Items[index].WavPath;
+                if (!SpeakingSessionStore.IsUsableWavFile(path))
+                {
+                    error = $"口语音频已失效：第 {index + 1} 题的 WAV 文件不存在或无效。已取消自动录音，没有跳题。请重新打开口语题准备并生成音频后重试。";
+                    return false;
+                }
+            }
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException)
+        {
+            error = $"无法验证口语音频：{ex.Message}。已取消自动录音，没有跳题。";
             return false;
         }
     }

@@ -46,6 +46,16 @@ public sealed partial class EtsPreviewPage : Page
 
     private void Page_Loaded(object sender, RoutedEventArgs e)
     {
+        if (!AppPreferencesService.Current.IntegrateEtsMainProgramEnabled)
+        {
+            _preview.RestoreForDisabledIntegration();
+            PreviewPlaceholder.Visibility = Visibility.Visible;
+            ConnectionRing.IsActive = false;
+            ConnectionStatus.Text = LocalizationService.Current.Translate(
+                "请先在答题设置中启用“集成ETS主程序”。");
+            return;
+        }
+
         _preview.SetPreviewPageActive(true, PreviewViewport);
         _windowMonitor = DispatcherQueue.CreateTimer();
         _windowMonitor.Interval = TimeSpan.FromSeconds(1);
@@ -202,6 +212,7 @@ public sealed partial class EtsPreviewPage : Page
 
     private void TryFindRunningEts(bool automatic)
     {
+        if (!AppPreferencesService.Current.IntegrateEtsMainProgramEnabled) return;
         if (_connecting || (automatic && DateTime.UtcNow < _nextSearchAt)) return;
         if (!automatic) DiagnosticLogService.Info("ets_preview.connection.search_requested");
         _connecting = true;

@@ -238,24 +238,29 @@ public sealed class EtsWindowPreviewService : IDisposable
                 }
 
                 bool wasVisible = IsWindowVisible(_embeddedWindow);
-                bool frameStyleChanged = EnsureBorderlessPreviewStyle(_embeddedWindow);
-                bool windowBoundsMatch = GetWindowRect(_embeddedWindow, out NativeRect current) &&
+                bool hasCurrentBounds = GetWindowRect(_embeddedWindow, out NativeRect current);
+                bool windowBoundsMatch = hasCurrentBounds &&
                     current.Left == bounds.X && current.Top == bounds.Y &&
                     current.Right - current.Left == bounds.Width &&
                     current.Bottom - current.Top == bounds.Height;
-                bool clientBoundsMatch = GetClientRect(_embeddedWindow, out NativeRect client) &&
-                    client.Right - client.Left == bounds.Width && client.Bottom - client.Top == bounds.Height;
-                if (wasVisible && !frameStyleChanged && windowBoundsMatch && clientBoundsMatch)
+                bool windowSizeMatches = hasCurrentBounds &&
+                    current.Right - current.Left == bounds.Width &&
+                    current.Bottom - current.Top == bounds.Height;
+
+                // Do not rewrite ETS styles or force a non-client frame recalculation during
+                // ordinary focus/input changes. ETS owns its message loop; those cross-process
+                // changes can collide with its own handling of a click. The borderless style is
+                // applied once in AttachWindow. Here we only move/resize when the host layout
+                // actually changed, and refresh the region only after a size change.
+                if (wasVisible && windowBoundsMatch)
                     return;
 
-                // Only reposition when ETS or the assistant actually changed bounds.
-                // The ETS HWND is owned by the assistant, so it stays above the
-                // assistant without repeatedly raising it in the Z order.
+                // Keep ETS above the assistant without activating or raising it in the Z order.
                 uint flags = SwpNoActivate | SwpNoZOrder;
                 if (wasVisible) flags |= SwpShowWindow;
-                if (frameStyleChanged || !clientBoundsMatch) flags |= SwpFrameChanged;
-                SetWindowPos(_embeddedWindow, 0, bounds.X, bounds.Y, bounds.Width, bounds.Height, flags);
-                ApplyPreviewCornerMask(_embeddedWindow, bounds.Width, bounds.Height);
+                SetWindowPosChecked(_embeddedWindow, 0, bounds.X, bounds.Y, bounds.Width, bounds.Height, flags);
+                if (!windowSizeMatches)
+                    ApplyPreviewCornerMask(_embeddedWindow, bounds.Width, bounds.Height);
                 if (!wasVisible) FadeInPreviewWindow(_embeddedWindow);
             }
         }
@@ -298,6 +303,17 @@ public sealed class EtsWindowPreviewService : IDisposable
             try { preview.Dispose(); }
             catch (Exception) { }
         }
+    }
+
+    public void RestoreForDisabledIntegration()
+    {
+        _previewPageActive = false;
+        _previewViewport = null;
+        _navigationPaneOverlayOpen = false;
+        RestoreEmbeddedWindow();
+        ClearPreviewState();
+        ResetCandidateWindow();
+        DiagnosticLogService.Info("ets_preview.integration.disabled");
     }
 
     private void EnsureMainWindow()

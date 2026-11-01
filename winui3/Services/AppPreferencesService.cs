@@ -27,6 +27,7 @@ public sealed class AppPreferencesService
     public bool VirtualCableReminderShown { get; private set; }
     public bool WelcomeCompleted { get; private set; }
     public bool AutoUpdateEnabled { get; private set; } = true;
+    public bool IntegrateEtsMainProgramEnabled { get; private set; }
     public bool InternalTestNoUpdatesEnabled => InternalTestNoUpdates;
     public bool VerboseLoggingEnabled { get; private set; }
     public bool DeveloperToolsUnlocked { get; private set; }
@@ -34,6 +35,7 @@ public sealed class AppPreferencesService
     public event Action? ThemeChanged;
     public event Action? LanguageChanged;
     public event Action? SpeakingModeChanged;
+    public event Action? EtsProgramIntegrationChanged;
 
     public void SetTheme(string theme)
     {
@@ -68,6 +70,15 @@ public sealed class AppPreferencesService
         if (AutoUpdateEnabled == enabled) return;
         AutoUpdateEnabled = enabled;
         Save();
+    }
+
+    public void SetEtsProgramIntegration(bool enabled)
+    {
+        if (IntegrateEtsMainProgramEnabled == enabled) return;
+        IntegrateEtsMainProgramEnabled = enabled;
+        Save();
+        DiagnosticLogService.Info("settings.ets_program_integration.changed", $"enabled={enabled}");
+        EtsProgramIntegrationChanged?.Invoke();
     }
 
     public void SetVerboseLogging(bool enabled)
@@ -148,6 +159,7 @@ public sealed class AppPreferencesService
             WelcomeCompleted = ReadBool(document.RootElement, "welcome_completed");
             AutoUpdateEnabled = !document.RootElement.TryGetProperty("auto_update_enabled", out JsonElement update) ||
                                 update.ValueKind is not (JsonValueKind.True or JsonValueKind.False) || update.GetBoolean();
+            IntegrateEtsMainProgramEnabled = ReadBool(document.RootElement, "integrate_ets_main_program_enabled");
             VerboseLoggingEnabled = ReadBool(document.RootElement, "verbose_logging_enabled");
             DeveloperToolsUnlocked = ReadBool(document.RootElement, "developer_tools_unlocked");
             if (document.RootElement.TryGetProperty("last_update_check_utc", out JsonElement lastCheck) &&
@@ -172,6 +184,7 @@ public sealed class AppPreferencesService
                 virtual_cable_reminder_shown = VirtualCableReminderShown,
                 welcome_completed = WelcomeCompleted,
                 auto_update_enabled = AutoUpdateEnabled,
+                integrate_ets_main_program_enabled = IntegrateEtsMainProgramEnabled,
                 verbose_logging_enabled = VerboseLoggingEnabled,
                 developer_tools_unlocked = DeveloperToolsUnlocked,
                 last_update_check_utc = LastUpdateCheckUtc?.ToString("O")

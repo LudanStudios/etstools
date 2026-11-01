@@ -33,27 +33,109 @@ DEFAULT_CONFIG = Path(__file__).resolve().parent / "ets_answer_config.yaml"
 RESET_REQUEST_FILE = "reset_request.json"
 RESET_ACK_FILE = "reset_ack.json"
 APP_TITLE = "E听说"
-NEXT_CONFIRM_SECONDS = 1.2
-MIN_SKIP_CONFIRM_SECONDS = 0.15
+NEXT_CONFIRM_SECONDS = 3.0
+NEXT_RETRY_COOLDOWN_SECONDS = 10.0
 WATCH_INTERVAL_SECONDS = 0.15
 LAST_NEXT_CLICK_AT = 0.0
-QUESTION_JS = r"""(()=>{
+PENDING_NEXT_CLICKS: dict[tuple[str, tuple[str, ...]], float] = {}
+_DIAGNOSTIC_LOG_TIMES: dict[str, float] = {}
+
+
+def warn_throttled(key: str, message: str, interval_seconds: float = 20.0) -> None:
+    now = time.monotonic()
+    if now - _DIAGNOSTIC_LOG_TIMES.get(key, 0.0) < interval_seconds:
+        return
+    _DIAGNOSTIC_LOG_TIMES[key] = now
+    print(f"WARN: {message}", flush=True)
+
+
+NAV_STATUS_JS = r"""(()=>{
+ const docs=[document,document.querySelector('iframe.examIframe')?.contentDocument].filter(Boolean);
+ const green=value=>{
+   const m=String(value||'').match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+   if(!m)return false;
+   const r=Number(m[1]),g=Number(m[2]),b=Number(m[3]);
+   return g>=90&&g>r*1.18&&g>b*0.82;
+ };
+ const hasDoneMarker=tile=>{
+   const nodes=[tile,...tile.querySelectorAll('*')].slice(0,64);
+   for(let parent=tile.parentElement,depth=0;parent&&depth<4;parent=parent.parentElement,depth++)nodes.push(parent);
+   for(const node of nodes){
+     const tokens=(node.getAttribute('class')||'').split(/\s+/).filter(Boolean);
+     if(tokens.some(token=>/(^|[-_])(answered|complete|completed|done|finished|success|correct)([-_]|$)/i.test(token)&&! /^(un|not)[-_]/i.test(token)))return true;
+     const label=[node.getAttribute('aria-label'),node.getAttribute('title'),node.getAttribute('data-status')].filter(Boolean).join(' ');
+     if(/已答|已完成|已作答|\banswered\b|\bcompleted\b|\bfinished\b|\bdone\b/i.test(label))return true;
+     if(/^[✓✔√]$/.test((node.textContent||'').trim()))return true;
+     const view=node.ownerDocument.defaultView,style=view.getComputedStyle(node);
+     if(green(style.color)||green(style.backgroundColor)||green(style.borderColor)||green(style.fill)||green(style.stroke))return true;
+     for(const pseudo of ['::before','::after']){
+       const ps=view.getComputedStyle(node,pseudo);
+       if(ps.content&&ps.content!=='none'&&/[✓✔√]/.test(ps.content))return true;
+       if(green(ps.color)||green(ps.backgroundColor)||green(ps.borderColor))return true;
+     }
+   }
+   return false;
+ };
+ const progress=()=>{
+   const text=docs.map(doc=>doc.body?.innerText||'').join('\n');
+   const m=text.match(/(?:已答|已完成|已作答)\s*[:：]?\s*(\d+)\s*(?:\/|／)\s*(\d+)/)||text.match(/(?:answered|completed)\s*[:：]?\s*(\d+)\s*(?:\/|of)\s*(\d+)/i);
+   return m?Number(m[1]):null;
+ };
+ return number=>{
+   number=Number(number);
+   if(!Number.isFinite(number)||number<1)return {found:false,done:false,answeredCount:progress()};
+   const expected=String(number),regions=[];
+   for(const doc of docs){
+     const width=doc.documentElement?.clientWidth||doc.defaultView?.innerWidth||0;
+     for(const el of doc.querySelectorAll('button,a,[role="button"],li,div,span')){
+       if((el.textContent||'').replace(/\s+/g,'').trim()!==expected)continue;
+       let node=el;
+       for(let depth=0;node&&depth<4;depth++,node=node.parentElement){
+         const r=node.getBoundingClientRect();
+         if(r.width<28||r.height<22||r.width>180||r.height>120||r.left<width*0.58)continue;
+         regions.push({node,area:r.width*r.height,left:r.left});
+       }
+     }
+   }
+   regions.sort((a,b)=>a.area-b.area||b.left-a.left);
+   const tile=regions[0]?.node||null;
+   return {found:!!tile,done:!!tile&&hasDoneMarker(tile),answeredCount:progress()};
+ };
+})()"""
+
+
+QUESTION_JS = r"""(questionOrder={})=>{
+ const navStatus=""" + NAV_STATUS_JS + r""";
  const f=document.querySelector('iframe.examIframe'),d=f?.contentDocument;
  if(!d)return JSON.stringify({ready:false});
  const qs=[...d.querySelectorAll('.question2')].filter(x=>x.getBoundingClientRect().height>0&&/^\d+_\d+$/.test(x.id));
  if(!qs.length)return JSON.stringify({ready:false});
  const fr=f.getBoundingClientRect();
- const questions=qs.map(q=>({id:q.id,options:[...q.querySelectorAll('.choose2')].map(e=>{
-   const t=e.querySelector('.choose2_text')||e,r=t.getBoundingClientRect();
-   return {id:e.id,cls:e.className,text:t.innerText,rect:{x:fr.left+r.left,y:fr.top+r.top,w:r.width,h:r.height}};
- })}));
+ const sx=fr.width/(f.clientWidth||fr.width),sy=fr.height/(f.clientHeight||fr.height);
+ const frameLeft=fr.left+f.clientLeft*sx,frameTop=fr.top+f.clientTop*sy;
+ const questions=qs.map(q=>{const order=questionOrder[q.id]||null,nav=order?navStatus(order):{done:false,found:false,answeredCount:null};return {id:q.id,order,recorded:nav.done,navFound:nav.found,answeredCount:nav.answeredCount,options:[...q.querySelectorAll('.choose2')].map(e=>{
+   const t=e.querySelector('.choose2_text')||e,r=t.getBoundingClientRect(),er=e.getBoundingClientRect();
+   const candidates=[e.querySelector('input[type="radio"]:not(:disabled)'),e.querySelector('label,[role="radio"]'),t,e];
+   const clicks=candidates.filter(Boolean).map(target=>{
+     const b=target.getBoundingClientRect();
+     return b.width>0&&b.height>0?{x:frameLeft+(b.left+b.width/2)*sx,y:frameTop+(b.top+b.height/2)*sy}:null;
+   }).filter((point,i,all)=>point&&all.findIndex(other=>other&&Math.abs(other.x-point.x)<2&&Math.abs(other.y-point.y)<2)===i);
+   const hit=(r.width>0&&r.height>0)?r:er;
+   const classSelected=[...e.classList].some(c=>/(?:^|[_-])(selected|checked)$/i.test(c));
+   return {id:e.id,cls:e.className,text:t.innerText,selected:classSelected||e.getAttribute('aria-checked')==='true'||e.getAttribute('aria-selected')==='true'||e.getAttribute('aria-pressed')==='true'||e.matches(':checked')||!!e.querySelector(':checked'),
+     clicks:clicks.length?clicks:[{x:frameLeft+(hit.left+hit.width/2)*sx,y:frameTop+(hit.top+hit.height/2)*sy}]};
+  })}});
  return JSON.stringify({ready:true,questions});
-})()"""
-CHECK_JS = r"""(id,index)=>{
+}"""
+CHECK_JS = r"""(id,index,number)=>{
+ const navStatus=""" + NAV_STATUS_JS + r""";
  const d=document.querySelector('iframe.examIframe')?.contentDocument;
  const q=[...(d?.querySelectorAll('.question2')||[])].find(x=>x.id===id);
  const e=q?.querySelectorAll('.choose2')[index];
- return JSON.stringify({id:q?.id,cls:e?.className,selected:/selected/.test(e?.className||'')});
+ const classSelected=!!e&&[...e.classList].some(c=>/(?:^|[_-])(selected|checked)$/i.test(c));
+ const selected=!!e&&(classSelected||e.getAttribute('aria-checked')==='true'||e.getAttribute('aria-selected')==='true'||e.getAttribute('aria-pressed')==='true'||e.matches(':checked')||!!e.querySelector(':checked'));
+ const nav=navStatus(number);
+ return JSON.stringify({id:q?.id,cls:e?.className,selected,recorded:nav.done,navFound:nav.found,answeredCount:nav.answeredCount});
 }"""
 
 
@@ -310,6 +392,36 @@ def question_order_key(question_id: str, order: dict[str, int]) -> tuple[int, tu
     return order.get(question_id, 2**63 - 1), question_sort_key(question_id)
 
 
+def first_unanswered_in_visible_range(
+    remaining: list[str],
+    questions: list[dict[str, Any]],
+    question_order: dict[str, int],
+) -> str | None:
+    """Return an unanswered question that lies at or before the visible group."""
+    visible_orders = [
+        question_order[question_id]
+        for question in questions
+        if (question_id := str(question.get("id", ""))) in question_order
+    ]
+    if not visible_orders:
+        return None
+    last_visible_number = max(visible_orders)
+    visible_content_ids = {
+        question_id.rsplit("_", 1)[0]
+        for question in questions
+        if (question_id := str(question.get("id", "")))
+    }
+    missed = [
+        question_id for question_id in remaining
+        if question_id.rsplit("_", 1)[0] in visible_content_ids
+        or (
+            question_id in question_order
+            and question_order[question_id] <= last_visible_number
+        )
+    ]
+    return min(missed, key=lambda question_id: question_order_key(question_id, question_order)) if missed else None
+
+
 def load_answer_config(path: Path = DEFAULT_CONFIG) -> tuple[float, str, float, bool]:
     """Read the small, flat YAML subset used for QA answer settings."""
     if not path.is_file():
@@ -374,8 +486,12 @@ def answer_for_accuracy(
     return wrong_answers[rng.randrange(len(wrong_answers))]
 
 
-def visible_questions(client: CDPClient) -> list[dict[str, Any]]:
-    raw = client.evaluate(QUESTION_JS)
+def visible_questions(
+    client: CDPClient,
+    question_order: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    order_json = json.dumps(question_order or {}, separators=(",", ":"))
+    raw = client.evaluate(f"({QUESTION_JS})({order_json})")
     if not raw:
         return []
     try:
@@ -391,24 +507,73 @@ def choose_answer(client: CDPClient, question: dict[str, Any], letter: str) -> b
     options = question.get("options") or []
     if index < 0 or index >= len(options):
         return False
-    if "selected" not in str(options[index].get("cls", "")):
-        expression = (
-            "(()=>{const d=document.querySelector('iframe.examIframe')?.contentDocument;"
-            f"const q=[...(d?.querySelectorAll('.question2')||[])].find(x=>x.id==={json.dumps(question_id)});"
-            f"const e=q?.querySelectorAll('.choose2')[{index}];if(!e)return '';e.click();return e.className;}})()"
-        )
+    order_number = question.get("order")
+    initial_answered_count = question.get("answeredCount")
+    check_expr = f"({CHECK_JS})({json.dumps(question_id)},{index},{json.dumps(order_number)})"
+
+    def read_state() -> dict[str, Any]:
         try:
-            if not client.evaluate(expression):
-                return False
-        except CDPError:
+            return json.loads(client.evaluate(check_expr) or "{}")
+        except (CDPError, TypeError, json.JSONDecodeError):
+            return {}
+
+    def is_recorded() -> bool:
+        return bool(read_state().get("recorded"))
+
+    def is_confirmed() -> bool:
+        state = read_state()
+        if state.get("id") != question_id or not state.get("selected"):
             return False
-    time.sleep(0.25)
-    check_expr = f"({CHECK_JS})({json.dumps(question_id)},{index})"
+        if state.get("recorded"):
+            return True
+        current_count = state.get("answeredCount")
+        return (
+            initial_answered_count is not None
+            and current_count is not None
+            and int(current_count) > int(initial_answered_count)
+        )
+
+    if question.get("recorded") or is_recorded():
+        return True
+
+    # Use a real DevTools input click first. Some ETS builds ignore HTMLElement.click()
+    # because the option handler checks for a trusted user input event.
+    points = options[index].get("clicks") or [options[index].get("click") or {}]
+    for point in points:
+        try:
+            x, y = float(point["x"]), float(point["y"])
+            if x < 0 or y < 0:
+                continue
+            client.click(x, y)
+        except (CDPError, TypeError, ValueError, KeyError):
+            continue
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            if is_confirmed():
+                return True
+            time.sleep(0.1)
+
+    # Retain the DOM click as a compatibility fallback for ETS layouts where the
+    # visible text rectangle is not the clickable hit target.
+    expression = (
+        "(()=>{const d=document.querySelector('iframe.examIframe')?.contentDocument;"
+        f"const q=[...(d?.querySelectorAll('.question2')||[])].find(x=>x.id==={json.dumps(question_id)});"
+        f"const e=q?.querySelectorAll('.choose2')[{index}];if(!e)return '';"
+        "const target=e.querySelector('input[type=radio]:not(:disabled),label,[role=radio],.choose2_text')||e;"
+        "target.click();return e.className;})()"
+    )
     try:
-        state = json.loads(client.evaluate(check_expr) or "{}")
-    except (TypeError, json.JSONDecodeError):
+        if not client.evaluate(expression):
+            return False
+    except CDPError:
         return False
-    return state.get("id") == question_id and bool(state.get("selected"))
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if is_confirmed():
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def click_next(
@@ -418,41 +583,69 @@ def click_next(
 ) -> bool:
     """Send a trusted mouse click and confirm that ETS actually changed questions."""
     global LAST_NEXT_CLICK_AT
+    if before_ids is None:
+        before_ids = {str(item.get("id", "")) for item in visible_questions(client)}
+    old_url = str(client.evaluate("location.href") or "")
+    before_ids = {question_id for question_id in before_ids if question_id}
+    transition_key = (old_url, tuple(sorted(before_ids)))
+
+    def page_advanced() -> bool:
+        current = visible_questions(client)
+        current_ids = {str(item.get("id", "")) for item in current if item.get("id")}
+        if current_ids and current_ids != before_ids:
+            return True
+        if not current_ids:
+            state = client.evaluate(
+                "JSON.stringify({url:location.href,text:document.querySelector('#app')?.innerText||''})"
+            )
+            try:
+                page = json.loads(state or "{}")
+            except json.JSONDecodeError:
+                page = {}
+            if page.get("url") != old_url or re.search(
+                r"提交成功|已完成|答题结果|成绩|本次练习", page.get("text", "")
+            ):
+                return True
+        return False
+
+    # A previous click may still be animating or waiting on ETS. Observe that
+    # transition before allowing another click on the same question group.
+    pending_since = PENDING_NEXT_CLICKS.get(transition_key)
+    if pending_since is not None:
+        retry_at = pending_since + NEXT_RETRY_COOLDOWN_SECONDS
+        while time.monotonic() < retry_at:
+            if page_advanced():
+                PENDING_NEXT_CLICKS.pop(transition_key, None)
+                return True
+            time.sleep(0.1)
+        PENDING_NEXT_CLICKS.pop(transition_key, None)
+        return False
+
     remaining_delay = skip_interval_seconds - (time.monotonic() - LAST_NEXT_CLICK_AT)
     if remaining_delay > 0:
         time.sleep(remaining_delay)
-    if before_ids is None:
-        before_ids = {str(item.get("id", "")) for item in visible_questions(client)}
+        if page_advanced():
+            return True
+
     expr = r"(()=>{const b=[...document.querySelectorAll('button')].find(x=>x.querySelector('.icon-nextQuestion'));if(!b||b.disabled||b.getAttribute('aria-disabled')==='true'||b.getClientRects().length===0)return '';const r=b.getBoundingClientRect();return JSON.stringify({x:r.left+r.width/2,y:r.top+r.height/2})})()"
     raw = client.evaluate(expr)
     if not raw:
         return False
     try:
         point = json.loads(raw)
-        old_url = client.evaluate("location.href")
+        old_url = str(client.evaluate("location.href") or "")
+        transition_key = (old_url, tuple(sorted(before_ids)))
         LAST_NEXT_CLICK_AT = time.monotonic()
+        PENDING_NEXT_CLICKS[transition_key] = LAST_NEXT_CLICK_AT
         client.click(float(point["x"]), float(point["y"]))
     except (TypeError, ValueError, KeyError, json.JSONDecodeError):
         return False
-    confirm_seconds = min(
-        NEXT_CONFIRM_SECONDS,
-        max(MIN_SKIP_CONFIRM_SECONDS, skip_interval_seconds),
-    )
-    deadline = time.monotonic() + confirm_seconds
+    deadline = time.monotonic() + NEXT_CONFIRM_SECONDS
     while time.monotonic() < deadline:
-        time.sleep(0.1)
-        current = visible_questions(client)
-        current_ids = {str(item.get("id", "")) for item in current}
-        if current_ids and current_ids != before_ids:
+        if page_advanced():
+            PENDING_NEXT_CLICKS.pop(transition_key, None)
             return True
-        if not current_ids:
-            state = client.evaluate("JSON.stringify({url:location.href,text:document.querySelector('#app')?.innerText||''})")
-            try:
-                page = json.loads(state or "{}")
-            except json.JSONDecodeError:
-                page = {}
-            if page.get("url") != old_url or re.search(r"提交成功|已完成|答题结果|成绩|本次练习", page.get("text", "")):
-                return True
+        time.sleep(0.1)
     return False
 
 
@@ -482,44 +675,66 @@ def run_once(
         try:
             targets = devtools_targets(endpoint)
         except (OSError, ValueError, json.JSONDecodeError):
+            warn_throttled("devtools-error", "无法连接 ETS 调试页面，自动答题正在重试。")
             time.sleep(0.5)
             continue
+        if not targets:
+            warn_throttled("no-devtools-page", "未发现 ETS 答题页面，自动答题正在等待。")
         for target in targets:
             pack_id = pack_id_from_url(str(target.get("url", "")))
             if expected_pack_id is not None and pack_id != expected_pack_id:
                 continue
             pack_dir = root / pack_id if pack_id and pack_id.isdigit() else None
-            if not pack_dir or not pack_dir.is_dir():
+            if not pack_dir:
+                continue
+            if not pack_dir.is_dir():
+                warn_throttled(f"no-pack:{pack_id}", f"本机找不到试卷 {pack_id} 的答案包，自动答题正在等待。")
                 continue
             try:
                 answers = load_answers(pack_dir)
                 if not answers:
+                    warn_throttled(
+                        f"no-answers:{pack_id}",
+                        f"试卷 {pack_id} 没有可用的本地答案，自动答题正在等待。",
+                    )
                     continue
                 question_order = load_question_order(pack_dir)
                 client = CDPClient(target["webSocketDebuggerUrl"])
             except (OSError, ValueError, json.JSONDecodeError, CDPError):
                 continue
             try:
-                questions = visible_questions(client)
+                questions = visible_questions(client, question_order)
                 if not questions:
+                    warn_throttled(
+                        f"no-question-elements:{pack_id}",
+                        f"试卷 {pack_id} 当前页面未找到可识别的选择题元素。",
+                    )
                     continue
                 visible_ids = {str(question.get("id", "")) for question in questions}
                 if processed is not None and visible_ids:
-                    ordered_visible = [question_order.get(question_id) for question_id in visible_ids]
-                    known_visible = [number for number in ordered_visible if number is not None]
-                    if known_visible:
-                        first_visible_number = min(known_visible)
-                        processed.update(
-                            question_id for question_id in answers
-                            if question_id in question_order
-                            and question_order[question_id] < first_visible_number
-                        )
+                    # Only count a visible question as processed when its selected
+                    # state is confirmed. Do not infer that earlier IDs were answered
+                    # from ordering: ETS can temporarily omit question elements while
+                    # a page is rendering, which otherwise permanently skips them.
+                    for question in questions:
+                        question_id = str(question.get("id", ""))
+                        if question.get("recorded"):
+                            processed.add(question_id)
+                        else:
+                            processed.discard(question_id)
                 pending = [
                     question for question in questions
                     if processed is None or str(question.get("id", "")) not in processed
                 ]
                 if not pending:
                     remaining = [key for key in answers if key not in (processed or set())]
+                    missed_id = first_unanswered_in_visible_range(remaining, questions, question_order)
+                    if missed_id:
+                        warn_throttled(
+                            f"unanswered-before-next:{pack_id}:{missed_id}",
+                            f"试卷 {pack_id} 检测到尚未确认作答的题目 {missed_id}；已暂停切题以避免漏答。",
+                        )
+                        return "waiting", missed_id
                     if remaining and click_next(client, visible_ids, skip_interval_seconds):
                         return "advanced", None
                     if not remaining:
@@ -542,7 +757,11 @@ def run_once(
                         accuracy, random_seed, session_key,
                     )
                     if not choose_answer(client, question, answer):
-                        print(f"Could not verify a trusted click on question {question_id}", flush=True)
+                        print(
+                            f"WARN: 未确认 ETS 已录入答案：试卷 {pack_id}，题目 {question_id}，"
+                            f"选项 {answer}，当前识别到 {len(question.get('options') or [])} 个选项。",
+                            flush=True,
+                        )
                         return "error", question_id
                     selected_ids.add(question_id)
                     record_answer(root, pack_dir, analysis_session_id, question_id, answer, correct_answer)
@@ -550,6 +769,13 @@ def run_once(
                 if processed is not None:
                     processed.update(selected_ids)
                 remaining = [key for key in answers if key not in (processed or set()) | selected_ids]
+                missed_id = first_unanswered_in_visible_range(remaining, questions, question_order)
+                if missed_id:
+                    warn_throttled(
+                        f"unanswered-before-next:{pack_id}:{missed_id}",
+                        f"试卷 {pack_id} 检测到尚未确认作答的题目 {missed_id}；已暂停切题以避免漏答。",
+                    )
+                    return "waiting", missed_id
                 if remaining:
                     if not click_next(client, visible_ids, skip_interval_seconds):
                         print("Next button did not advance the visible questions; will retry.", flush=True)
@@ -640,20 +866,18 @@ def watch(root: Path, endpoint: str, config_path: Path | None = None) -> int:
                     # question as a fresh pass through the same pack.
                     try:
                         answers = load_answers(pack_dir)
+                        question_order = load_question_order(pack_dir)
                         client = CDPClient(target["webSocketDebuggerUrl"])
                         try:
-                            current = visible_questions(client)
+                            current = visible_questions(client, question_order)
                         finally:
                             client.close()
-                        # Content IDs are database identifiers, not exercise order.
-                        # Detect a restarted attempt from its cleared selections instead
-                        # of treating the numerically smallest ID as the first question.
-                        has_selection = any(
-                            "selected" in str(option.get("cls", ""))
-                            for question in current
-                            for option in question.get("options", [])
+                        # A checked-looking radio is not proof that ETS recorded it;
+                        # only the right-side completed marker confirms this attempt.
+                        has_recorded_answer = any(
+                            bool(question.get("recorded")) for question in current
                         )
-                        if current and not has_selection:
+                        if current and not has_recorded_answer:
                             handled.discard(session_key)
                             processed.pop(session_key, None)
                             analysis_sessions.pop(session_key, None)

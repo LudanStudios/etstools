@@ -26,7 +26,6 @@ public sealed partial class MainWindow : Window
     private bool _checkingSpeakingPaper;
     private bool _checkingAudioSession;
     private bool _audioSessionActive;
-    private bool _audioSessionSawShell;
     private SpeakingPrepWindow? _prepWindow;
     private DispatcherQueueTimer? _paneClosingTimer;
     private string? _currentPageName;
@@ -44,6 +43,7 @@ public sealed partial class MainWindow : Window
         {
             DiagnosticLogService.Info("etstool.window.closed");
             AnalysisActivityService.Current.Changed -= UpdateActivityNavigation;
+            AppPreferencesService.Current.EtsProgramIntegrationChanged -= OnEtsProgramIntegrationChanged;
             EtsWindowPreviewService.RestoreAll();
             _audioSessionTimer?.Stop();
             try { await DefaultAudioInputService.Current.EndSessionAsync(); }
@@ -60,6 +60,10 @@ public sealed partial class MainWindow : Window
 
         AppPreferencesService preferences = AppPreferencesService.Current;
         DiagnosticLogService.SetVerboseEnabled(preferences.VerboseLoggingEnabled);
+        EtsPreviewNavigationItem.Visibility = preferences.IntegrateEtsMainProgramEnabled
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        preferences.EtsProgramIntegrationChanged += OnEtsProgramIntegrationChanged;
         Activated += (_, args) =>
         {
             if (args.WindowActivationState == WindowActivationState.Deactivated)
@@ -138,17 +142,39 @@ public sealed partial class MainWindow : Window
         try
         {
             AssistantService assistant = AssistantService.Current;
-            bool shellRunning = assistant.IsEtsShellProcessRunning;
-            if (shellRunning) _audioSessionSawShell = true;
-            bool etsRunning = _audioSessionSawShell
-                ? shellRunning
-                : assistant.IsEtsProcessRunning;
-            if (etsRunning == _audioSessionActive) return;
-            if (etsRunning)
-                _ = await DefaultAudioInputService.Current.BeginSessionAsync();
-            else
-                await DefaultAudioInputService.Current.EndSessionAsync();
-            _audioSessionActive = etsRunning;
+            bool etsRunning = assistant.IsEtsProcessRunning;
+            if (!etsRunning)
+            {
+                if (_audioSessionActive)
+                    await DefaultAudioInputService.Current.EndSessionAsync();
+                _audioSessionActive = false;
+                _lastAudioSessionError = null;
+                return;
+            }
+
+            DefaultAudioInputStatus? currentInput = await DefaultAudioInputService.Current.GetStatusAsync();
+            if (currentInput?.IsVirtualCable == true)
+            {
+                _audioSessionActive = true;
+                _lastAudioSessionError = null;
+                return;
+            }
+
+            string result = await DefaultAudioInputService.Current.BeginSessionAsync();
+            DefaultAudioInputStatus? input = await DefaultAudioInputService.Current.GetStatusAsync();
+            if (input?.IsVirtualCable != true)
+            {
+                string detail = $"ETS 正在运行，但默认录音设备未切换到 VB-CABLE。当前：{input?.Name ?? "无法读取"}；{result}";
+                if (!string.Equals(_lastAudioSessionError, detail, StringComparison.Ordinal))
+                {
+                    DiagnosticLogService.Warn("audio_session.sync.virtual_mic_not_active", detail);
+                    _lastAudioSessionError = detail;
+                }
+                _audioSessionActive = false;
+                return;
+            }
+
+            _audioSessionActive = true;
             _lastAudioSessionError = null;
         }
         catch (Exception ex)
@@ -378,6 +404,9 @@ public sealed partial class MainWindow : Window
 
     public void NavigateToTag(string tag)
     {
+        if (tag == "etsPreview" && !AppPreferencesService.Current.IntegrateEtsMainProgramEnabled)
+            return;
+
         foreach (object item in RootNavigation.MenuItems.Concat(RootNavigation.FooterMenuItems))
         {
             if (item is NavigationViewItem nav && string.Equals(nav.Tag as string, tag, StringComparison.Ordinal))
@@ -387,6 +416,23 @@ public sealed partial class MainWindow : Window
                 break;
             }
         }
+    }
+
+    private void OnEtsProgramIntegrationChanged()
+    {
+        if (!DispatcherQueue.HasThreadAccess)
+        {
+            DispatcherQueue.TryEnqueue(OnEtsProgramIntegrationChanged);
+            return;
+        }
+
+        bool enabled = AppPreferencesService.Current.IntegrateEtsMainProgramEnabled;
+        EtsPreviewNavigationItem.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
+        if (enabled) return;
+
+        if (((RootNavigation.SelectedItem as NavigationViewItem)?.Tag as string) == "etsPreview")
+            NavigateToTag("overview");
+        EtsWindowPreviewService.Shared.RestoreForDisabledIntegration();
     }
 
     private void ApplyTheme()
@@ -417,6 +463,11 @@ public sealed partial class MainWindow : Window
     private void RootNavigation_SelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
     {
         if (args.SelectedItem is not NavigationViewItem item) return;
+        if ((item.Tag as string) == "etsPreview" && !AppPreferencesService.Current.IntegrateEtsMainProgramEnabled)
+        {
+            NavigateToTag("overview");
+            return;
+        }
         DiagnosticLogService.Info("navigation.tab.selected",
             $"tag={item.Tag?.ToString() ?? "unknown"} title={item.Content?.ToString() ?? "unknown"}");
         Type? page = item.Tag?.ToString() switch

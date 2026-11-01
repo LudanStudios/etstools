@@ -77,6 +77,7 @@ public sealed partial class SpeakingPrepWindow : Window
     private bool _sessionReady;
     private bool _autoStartInProgress;
     private bool _windowOpenedLogged;
+    private string? _autoRunnerFailureStatus;
 
     public SpeakingPrepWindow()
     {
@@ -98,10 +99,25 @@ public sealed partial class SpeakingPrepWindow : Window
         ApplyTheme();
         ConfigureWindow();
         AppPreferencesService.Current.ThemeChanged += ApplyTheme;
-        _autoRunner.Output += line => DispatcherQueue.TryEnqueue(() => StatusText.Text = line);
+        _autoRunner.Output += line => DispatcherQueue.TryEnqueue(() =>
+        {
+            StatusText.Text = line;
+            if (line.Contains("中止", StringComparison.Ordinal) ||
+                line.Contains("失败", StringComparison.Ordinal) ||
+                line.Contains("未确认成功", StringComparison.Ordinal))
+                _autoRunnerFailureStatus = line;
+        });
         _autoRunner.Exited += () => DispatcherQueue.TryEnqueue(() =>
         {
             StartAutoButtonText.Text = "开始自动口语";
+            if (!string.IsNullOrWhiteSpace(_autoRunnerFailureStatus))
+            {
+                StatusText.Text = _autoRunnerFailureStatus;
+                ErrorBar.Severity = InfoBarSeverity.Error;
+                ErrorBar.Message = _autoRunnerFailureStatus;
+                ErrorBar.IsOpen = true;
+                return;
+            }
             StatusText.Text = "自动口语已结束。";
         });
         Closed += (_, _) =>
@@ -255,6 +271,7 @@ public sealed partial class SpeakingPrepWindow : Window
         StartAutoButton.IsEnabled = false;
         try
         {
+            _autoRunnerFailureStatus = null;
             var cable = new VirtualCableService();
             try { await cable.RefreshAsync(); }
             catch (Exception) { }
@@ -280,20 +297,67 @@ public sealed partial class SpeakingPrepWindow : Window
                 .Where(File.Exists)
                 .OrderByDescending(path => File.GetLastWriteTimeUtc(path))
                 .FirstOrDefault() ?? sessionCandidates[0];
+            if (!SpeakingAutoRunner.HasUsableAudio(sessionPath, out string audioError))
+            {
+                DiagnosticLogService.Warn("speaking_prep.auto_speaking.stale_audio", audioError);
+                _sessionReady = false;
+                StartAutoButton.Visibility = Visibility.Collapsed;
+                HeaderStatusText.Visibility = Visibility.Visible;
+                SetHeaderStatus("重新生成音频", "AccentTextFillColorPrimaryBrush");
+                StatusText.Text = "上一轮临时音频已清理，正在重新生成；完成后会自动开始。";
+                ErrorBar.IsOpen = false;
+                _autoStartInProgress = false;
+                await PrepareAsync();
+                return;
+            }
+            string audioInputResult = await DefaultAudioInputService.Current.BeginSessionAsync();
+            DefaultAudioInputStatus? audioInput = null;
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                audioInput = await DefaultAudioInputService.Current.GetStatusAsync();
+                if (audioInput?.Name.Contains("CABLE Output", StringComparison.OrdinalIgnoreCase) == true)
+                    break;
+                await Task.Delay(250);
+            }
+            if (audioInput?.Name.Contains("CABLE Output", StringComparison.OrdinalIgnoreCase) != true)
+            {
+                string currentInput = audioInput?.Name ?? "无法读取";
+                string message = $"未能确认 ETS 正在使用虚拟麦克风 CABLE Output（当前 Windows 默认输入：{currentInput}）。"
+                    + $"已取消自动口语，没有推进题目。设置结果：{audioInputResult}。"
+                    + "请确认 ETS 麦克风设为 CABLE Output 或系统默认后重试。";
+                DiagnosticLogService.Warn("speaking_prep.auto_speaking.virtual_mic_not_ready", message);
+                ErrorBar.Severity = InfoBarSeverity.Error;
+                ErrorBar.Message = message;
+                ErrorBar.IsOpen = true;
+                StatusText.Text = "虚拟麦克风未就绪；本轮已取消，没有跳题。";
+                return;
+            }
+            DiagnosticLogService.Info("speaking_prep.auto_speaking.virtual_mic_ready",
+                $"device={audioInput.Name}; result={audioInputResult}");
             if (!_autoRunner.Start(assistant.AppRoot, assistant.DataRoot, sessionPath, out string error))
             {
                 DiagnosticLogService.Error("speaking_prep.auto_speaking.start_failed", error);
                 ErrorBar.Severity = InfoBarSeverity.Error;
                 ErrorBar.Message = error;
                 ErrorBar.IsOpen = true;
-                StatusText.Text = "音频已生成，但自动口语未能启动。";
+                if (error.Contains("口语音频已失效", StringComparison.Ordinal) ||
+                    error.Contains("没有可播放的音频", StringComparison.Ordinal))
+                {
+                    _sessionReady = false;
+                    StartAutoButton.Visibility = Visibility.Collapsed;
+                    StatusText.Text = "本轮已取消，未开始录音。请重新打开口语题准备并生成音频。";
+                }
+                else
+                {
+                    StatusText.Text = "音频已生成，但自动口语未能启动。";
+                }
                 return;
             }
 
             ErrorBar.IsOpen = false;
             DiagnosticLogService.Info("speaking_prep.auto_speaking.started", $"pack={_packId}");
             StartAutoButtonText.Text = "停止自动口语";
-            StatusText.Text = "自动口语已启动，等待 ETS 进入录音阶段…";
+            StatusText.Text = $"默认麦克风：{audioInput.Name}；等待 ETS 进入录音阶段…";
         }
         finally
         {

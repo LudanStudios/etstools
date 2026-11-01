@@ -46,6 +46,22 @@
                         <CheckBox x:Name="AutostartCheck" Content="登录 Windows 时在后台启动监听器" />
                         <TextBlock Text="开启后会等待 ETS 启动；ETS 打开时自动显示助手窗口。" FontSize="12" Opacity="0.68" />
                     </StackPanel>
+                    <StackPanel Spacing="3">
+                        <CheckBox x:Name="EtsProgramIntegrationCheck" IsChecked="False"
+                                  Click="EtsProgramIntegration_Click">
+                            <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                                <TextBlock Text="集成 ETS 主程序" FontSize="14" FontWeight="SemiBold"
+                                           VerticalAlignment="Center" />
+                                <Border Style="{StaticResource BetaBadgeStyle}">
+                                    <TextBlock Text="BETA" FontSize="10" FontWeight="SemiBold"
+                                               Foreground="#FF5B430F" HorizontalAlignment="Center"
+                                               VerticalAlignment="Center" />
+                                </Border>
+                            </StackPanel>
+                        </CheckBox>
+                        <TextBlock Text="开启后显示“程序预览”标签，并将 ETS 主窗口嵌入助手；关闭后恢复独立窗口。"
+                                   FontSize="12" Opacity="0.68" TextWrapping="Wrap" />
+                    </StackPanel>
                     <InfoBar x:Name="SaveInfoBar" IsOpen="False" />
                     <Button Click="Save_Click" Style="{StaticResource AccentButtonStyle}" HorizontalAlignment="Left">
                         <StackPanel Orientation="Horizontal" Spacing="8">

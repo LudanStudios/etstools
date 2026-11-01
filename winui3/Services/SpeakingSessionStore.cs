@@ -32,6 +32,24 @@ public sealed class SpeakingSessionStore
 
     public string FilePath => _path;
 
+    public static bool IsUsableWavFile(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        try
+        {
+            using var stream = File.OpenRead(path);
+            if (stream.Length <= 44) return false;
+            Span<byte> header = stackalloc byte[12];
+            if (stream.Read(header) != header.Length) return false;
+            return header[0] == (byte)'R' && header[1] == (byte)'I' &&
+                   header[2] == (byte)'F' && header[3] == (byte)'F' &&
+                   header[8] == (byte)'W' && header[9] == (byte)'A' &&
+                   header[10] == (byte)'V' && header[11] == (byte)'E';
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        { return false; }
+    }
+
     public SpeakingSession? Load()
     {
         foreach (string path in new[] { _path, _legacyPath })

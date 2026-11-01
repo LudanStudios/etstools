@@ -33,6 +33,7 @@ public sealed partial class SettingsPage : Page
         EtsPathText.Text = _service.EtsExe ?? "未找到 ETS 安装目录。";
         _loading = true;
         SpeakingModeBox.SelectedIndex = AppPreferencesService.Current.SpeakingMode == "flexible" ? 1 : 0;
+        EtsProgramIntegrationCheck.IsChecked = AppPreferencesService.Current.IntegrateEtsMainProgramEnabled;
         _loading = false;
         UpdateApiKeyStatus();
         UpdateAliyunStatus();
@@ -172,6 +173,12 @@ public sealed partial class SettingsPage : Page
         if (_loading) return;
         if (SpeakingModeBox.SelectedItem is ComboBoxItem { Tag: string mode })
             AppPreferencesService.Current.SetSpeakingMode(mode);
+    }
+
+    private void EtsProgramIntegration_Click(object sender, RoutedEventArgs e)
+    {
+        if (_loading || sender is not CheckBox checkBox) return;
+        AppPreferencesService.Current.SetEtsProgramIntegration(checkBox.IsChecked == true);
     }
 
     private void UpdateApiKeyStatus() =>

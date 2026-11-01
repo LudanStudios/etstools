@@ -16,10 +16,10 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>ETS-Assistant-WinUI</AssemblyName>
     <RootNamespace>ETSAssistant.WinUI3</RootNamespace>
-    <Version>1.2.3</Version>
-    <AssemblyVersion>1.2.3.0</AssemblyVersion>
-    <FileVersion>1.2.3.0</FileVersion>
-    <InformationalVersion>1.2.3</InformationalVersion>
+    <Version>1.2.4</Version>
+    <AssemblyVersion>1.2.4.0</AssemblyVersion>
+    <FileVersion>1.2.4.0</FileVersion>
+    <InformationalVersion>1.2.4</InformationalVersion>
     <WindowsSdkPackageVersion>10.0.26100.56</WindowsSdkPackageVersion>
   </PropertyGroup>
   <ItemGroup>

@@ -43,7 +43,7 @@
                 <NavigationViewItem Content="运行概览" Tag="overview">
                     <NavigationViewItem.Icon><SymbolIcon Symbol="Home" /></NavigationViewItem.Icon>
                 </NavigationViewItem>
-                <NavigationViewItem Content="程序预览" Tag="etsPreview">
+                <NavigationViewItem x:Name="EtsPreviewNavigationItem" Content="程序预览" Tag="etsPreview" Visibility="Collapsed">
                     <NavigationViewItem.Icon><SymbolIcon Symbol="View" /></NavigationViewItem.Icon>
                 </NavigationViewItem>
                 <NavigationViewItem Content="试卷管理" Tag="papers">

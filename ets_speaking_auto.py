@@ -14,9 +14,10 @@ import re
 import subprocess
 import sys
 import time
+import wave
 from pathlib import Path
 
-from ets_auto_answer import CDPClient, devtools_targets
+from ets_auto_answer import CDPClient, CDPError, devtools_targets
 
 APP_ROOT = (
     Path(sys.executable).resolve().parent
@@ -32,6 +33,7 @@ CABLE_PLAYER = next(
     ) if path.is_file()),
     APP_ROOT / "tools" / "CablePlayer" / "CablePlayer.exe",
 )
+PLAYER_SPEED_FACTOR = 1.30
 
 
 def find_session(explicit: str | None, data_root: Path) -> Path:
@@ -87,6 +89,74 @@ def log(message: str) -> None:
             pass
 
 
+def wav_duration_seconds(path: str | Path) -> float:
+    """Return the actual PCM duration so a detached player process cannot end early."""
+    try:
+        with wave.open(str(path), "rb") as audio:
+            sample_rate = audio.getframerate()
+            if sample_rate <= 0:
+                return 0.0
+            return max(0.0, audio.getnframes() / sample_rate)
+    except (OSError, wave.Error):
+        return 0.0
+
+
+def playback_duration_seconds(path: str | Path) -> float:
+    """The automatic run time-stretches TTS to fit ETS's fixed recording window."""
+    return wav_duration_seconds(path) / PLAYER_SPEED_FACTOR
+
+
+def terminate_player(player: subprocess.Popen[str] | None) -> None:
+    if player is None or player.poll() is not None:
+        return
+    try:
+        player.terminate()
+        player.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        try:
+            player.kill()
+            player.wait(timeout=2.0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    except OSError:
+        pass
+
+
+def finished_player_status(player: subprocess.Popen[str]) -> tuple[bool, str] | None:
+    """Check the player's terminal message; elapsed WAV time alone cannot prove output."""
+    if player.poll() is None:
+        return None
+    try:
+        output, _ = player.communicate(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        return None
+    output = output or ""
+    lowered = output.casefold()
+    markers = [
+        marker
+        for marker in ("PLAY", "DONE", "TIMEOUT", "media failed", "no VB-Audio render device", "missing:")
+        if marker.casefold() in lowered
+    ]
+    error_lines = [
+        line.strip()
+        for line in output.splitlines()
+        if any(marker in line.casefold() for marker in (
+            "media failed", "timeout", "no vb-audio render device", "missing:",
+            "waveout", "invalid wav", "unsupported wav", "playback error",
+        ))
+    ]
+    failed = (
+        player.returncode != 0
+        or "DONE" not in output
+        or "TIMEOUT" in output
+        or "media failed" in lowered
+        or "no VB-Audio render device" in lowered
+        or "missing:" in lowered
+    )
+    status = " | ".join(error_lines[-3:]) if failed and error_lines else ",".join(markers)
+    return failed, status or f"exit={player.returncode}; no DONE marker"
+
+
 def page_state(client: CDPClient) -> dict:
     raw = client.evaluate(
         "(()=>{const text=document.body.innerText;return JSON.stringify({"
@@ -128,7 +198,7 @@ def click_fix(client: CDPClient) -> bool:
     ) is True
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     global DATA_ROOT, LOG_PATH
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", default=None)
@@ -147,6 +217,20 @@ def main(argv: list[str] | None = None) -> int:
     if not wavs:
         log("session has no WAV files")
         return 1
+    if not Path(args.player).is_file():
+        log(f"口语音频播放器不存在：{Path(args.player).name}；已在开始录音前中止。")
+        return 6
+    invalid_wavs = [
+        (index + 1, Path(path).name)
+        for index, path in enumerate(wavs)
+        if not Path(path).is_file() or wav_duration_seconds(path) <= 0
+    ]
+    if invalid_wavs:
+        details = ", ".join(f"第 {index} 题 ({name})" for index, name in invalid_wavs[:5])
+        if len(invalid_wavs) > 5:
+            details += f" 等 {len(invalid_wavs)} 题"
+        log(f"口语音频文件已缺失或无效：{details}；已在 ETS 开始录音前中止，没有跳题。请重新生成音频。")
+        return 6
     log(f"session pack={session.get('PackId')} items={len(wavs)} mode={session.get('Mode')}")
 
     targets = devtools_targets()
@@ -165,6 +249,10 @@ def main(argv: list[str] | None = None) -> int:
     player: subprocess.Popen[str] | None = None
     index = max(0, args.start_index)
     started_at = 0.0
+    expected_playback_end = 0.0
+    playback_timeout_at = 0.0
+    playback_wait_logged = False
+    player_done_logged = False
     finished = False
     played = 0
     fix_attempts = 0
@@ -182,7 +270,34 @@ def main(argv: list[str] | None = None) -> int:
         while True:
             state = page_state(client)
             text = state["text"]
-            if ("练习结束" in text or "提交成功" in text) and (
+            player_status = finished_player_status(player) if player is not None else None
+            if player_status is not None and player_status[0]:
+                return_code = player.returncode
+                if not mock_exam and state["stop"]:
+                    click_stop(client)
+                log(
+                    f"音频播放器未确认成功输出 (code={return_code}, status={player_status[1]})；"
+                    "已中止自动口语，不会推进下一题。"
+                )
+                return 7
+            if player_status is not None and not player_done_logged:
+                remaining = expected_playback_end - time.monotonic()
+                if remaining > 0.75:
+                    if not mock_exam and state["stop"]:
+                        click_stop(client)
+                    log(
+                        f"音频播放器在 WAV 预计时长前退出约 {remaining:.1f}s "
+                        f"(code={player.returncode}, status={player_status[1]})；"
+                        "已中止自动口语，不推进下一题。"
+                    )
+                    return 7
+                log(f"CablePlayer completed successfully (status={player_status[1]})")
+                player_done_logged = True
+            audio_finished = (
+                player is None
+                or (time.monotonic() >= expected_playback_end and player.poll() is not None)
+            )
+            if audio_finished and ("练习结束" in text or "提交成功" in text) and (
                 not mock_exam or (played > 0 and not state["recording"])
             ):
                 if state["fix"] and fix_attempts < 2:
@@ -200,32 +315,57 @@ def main(argv: list[str] | None = None) -> int:
                 # recording phase and let ETS advance after its timer expires.
                 if state["recording"]:
                     if player is None and not mock_waiting_for_recording_end and index < len(wavs):
-                        started_at = time.time()
+                        started_at = time.monotonic()
+                        duration = wav_duration_seconds(wavs[index])
+                        playback_duration = duration / PLAYER_SPEED_FACTOR
+                        expected_playback_end = started_at + playback_duration + 0.25
+                        playback_timeout_at = started_at + max(args.max_question_seconds, playback_duration + 10.0)
+                        playback_wait_logged = False
+                        player_done_logged = False
                         played += 1
-                        log(f"[{index + 1}/{len(wavs)}] mock recording, playing {Path(wavs[index]).name}")
+                        log(
+                            f"[{index + 1}/{len(wavs)}] mock recording, playing {Path(wavs[index]).name} "
+                            f"({duration:.1f}s source, {playback_duration:.1f}s at {PLAYER_SPEED_FACTOR:.2f}x)"
+                        )
                         player = subprocess.Popen(
-                            [args.player, wavs[index]],
+                            [args.player, "--speed", f"{PLAYER_SPEED_FACTOR:.2f}", wavs[index]],
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                             text=True,
                             encoding="utf-8",
                             errors="replace",
                         )
-                    elif player is not None and player.poll() is not None:
+                    elif (
+                        player is not None
+                        and player.poll() is not None
+                        and time.monotonic() >= expected_playback_end
+                    ):
                         log(f"[{index + 1}/{len(wavs)}] playback ended; waiting for ETS recording to end")
                         player = None
                         mock_waiting_for_recording_end = True
-                    elif player is not None and time.time() - started_at > args.max_question_seconds:
-                        player.terminate()
-                        player = None
-                        mock_waiting_for_recording_end = True
-                        log(f"[{index + 1}/{len(wavs)}] playback timed out; waiting for ETS recording to end")
+                    elif player is not None and time.monotonic() > playback_timeout_at:
+                        terminate_player(player)
+                        log(f"[{index + 1}/{len(wavs)}] 播放超时；已终止本轮自动口语，不推进下一题。")
+                        return 8
                     time.sleep(0.2)
                     continue
                 if player is not None:
-                    player.terminate()
-                    player = None
-                    mock_waiting_for_recording_end = True
+                    now = time.monotonic()
+                    playback_complete = now >= expected_playback_end and player.poll() is not None
+                    if playback_complete:
+                        log(f"[{index + 1}/{len(wavs)}] playback ended; ETS recording already ended")
+                        player = None
+                        mock_waiting_for_recording_end = True
+                    else:
+                        elapsed = max(0.0, now - started_at)
+                        terminate_player(player)
+                        log(
+                            f"[{index + 1}/{len(wavs)}] ETS 录音窗口在音频结束前关闭 "
+                            f"(已播放约 {elapsed:.1f}/{playback_duration_seconds(wavs[index]):.1f}s，"
+                            f"原始音频 {wav_duration_seconds(wavs[index]):.1f}s，{PLAYER_SPEED_FACTOR:.2f}x)；"
+                            "本轮已中止，未把该题标记为完成。请检查 ETS 录音时长和麦克风设置后重试。"
+                        )
+                        return 9
                 if mock_waiting_for_recording_end:
                     index += 1
                     mock_waiting_for_recording_end = False
@@ -238,39 +378,62 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if state["stop"]:
                 if player is None and index < len(wavs):
-                    started_at = time.time()
+                    started_at = time.monotonic()
+                    duration = wav_duration_seconds(wavs[index])
+                    playback_duration = duration / PLAYER_SPEED_FACTOR
+                    expected_playback_end = started_at + playback_duration + 0.25
+                    playback_timeout_at = started_at + max(args.max_question_seconds, playback_duration + 10.0)
+                    playback_wait_logged = False
+                    player_done_logged = False
                     played += 1
-                    log(f"[{index + 1}/{len(wavs)}] recording, playing {Path(wavs[index]).name}")
+                    log(
+                        f"[{index + 1}/{len(wavs)}] recording, playing {Path(wavs[index]).name} "
+                        f"({duration:.1f}s source, {playback_duration:.1f}s at {PLAYER_SPEED_FACTOR:.2f}x)"
+                    )
                     player = subprocess.Popen(
-                        [args.player, wavs[index]],
+                        [args.player, "--speed", f"{PLAYER_SPEED_FACTOR:.2f}", wavs[index]],
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         text=True,
                         encoding="utf-8",
                         errors="replace",
                     )
-                if player is not None and player.poll() is not None:
+                if (
+                    player is not None
+                    and player.poll() is not None
+                    and time.monotonic() >= expected_playback_end
+                ):
                     time.sleep(0.8)
                     click_stop(client)
                     log(f"[{index + 1}/{len(wavs)}] stopped")
                     player = None
                     index += 1
                     time.sleep(1.5)
-                elif player is not None and time.time() - started_at > args.max_question_seconds:
-                    player.terminate()
-                    player = None
+                elif player is not None and time.monotonic() > playback_timeout_at:
+                    terminate_player(player)
                     click_stop(client)
-                    index += 1
-                    time.sleep(1.5)
+                    log(f"[{index + 1}/{len(wavs)}] 播放超时；已中止本轮自动口语，不推进下一题。")
+                    return 8
                 continue
 
             # Not recording: if a recording was auto-stopped, close the player.
             if player is not None:
-                player.terminate()
-                player = None
-                index += 1
-                time.sleep(1.0)
-                continue
+                now = time.monotonic()
+                if now >= expected_playback_end and player.poll() is not None:
+                    log(f"[{index + 1}/{len(wavs)}] playback ended; ETS recording already ended")
+                    player = None
+                    index += 1
+                    time.sleep(1.0)
+                    continue
+                elapsed = max(0.0, now - started_at)
+                terminate_player(player)
+                log(
+                    f"[{index + 1}/{len(wavs)}] ETS 录音窗口在音频结束前关闭 "
+                    f"(已播放约 {elapsed:.1f}/{playback_duration_seconds(wavs[index]):.1f}s，"
+                    f"原始音频 {wav_duration_seconds(wavs[index]):.1f}s，{PLAYER_SPEED_FACTOR:.2f}x)；"
+                    "本轮已中止，未把该题标记为完成。请检查 ETS 录音时长和麦克风设置后重试。"
+                )
+                return 9
 
             if index >= len(wavs):
                 log("all WAV items consumed")
@@ -285,14 +448,21 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 time.sleep(0.5)
     finally:
-        if player is not None:
-            player.terminate()
+        terminate_player(player)
         client.close()
     if finished and played > 0 and not args.keep_temp:
         cleanup_temp_audio(DATA_ROOT)
     elif played == 0:
         log("本次没有实际播放音频，保留 temp WAV 以便重试。")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except (OSError, CDPError, ValueError, TypeError) as exc:
+        log(f"自动口语已停止：ETS 页面连接中断或状态无效 ({exc})。可以返回 ETS 后重新开始。")
+        return 5
 
 
 if __name__ == "__main__":

@@ -8,8 +8,8 @@
                 <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
             </ResourceDictionary.MergedDictionaries>
             <Style x:Key="BetaBadgeStyle" TargetType="Border">
-                <Setter Property="Background" Value="#F59E0B" />
-                <Setter Property="CornerRadius" Value="4" />
+                <Setter Property="Background" Value="#E7B650" />
+                <Setter Property="CornerRadius" Value="7" />
                 <Setter Property="Height" Value="20" />
                 <Setter Property="MinWidth" Value="44" />
                 <Setter Property="Padding" Value="7,0" />

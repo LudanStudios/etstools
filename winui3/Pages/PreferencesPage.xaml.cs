@@ -98,7 +98,7 @@ public sealed partial class PreferencesPage : Page
         if (!internalTestMode) return;
 
         Version? version = typeof(PreferencesPage).Assembly.GetName().Version;
-        string versionText = version is null ? "1.2.3" : $"{version.Major}.{version.Minor}.{version.Build}";
+        string versionText = version is null ? "1.2.4" : $"{version.Major}.{version.Minor}.{version.Build}";
         string format = LocalizationService.Current.Translate("当前版本：{0} 内部测试版本，无法配置更新。");
         InternalTestNoUpdatesText.Text = string.Format(format, versionText);
     }

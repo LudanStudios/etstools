@@ -166,7 +166,8 @@ public sealed partial class OverviewPage : Page
             string message = warnings.Length == 0 ? "监听器已启动，ETS 正在打开。" : warnings;
             InfoBarPresenter.Show(GeneralInfoBar, title, message,
                 warnings.Length == 0 ? InfoBarSeverity.Success : InfoBarSeverity.Warning);
-            MainWindow.Current?.NavigateToTag("etsPreview");
+            if (AppPreferencesService.Current.IntegrateEtsMainProgramEnabled)
+                MainWindow.Current?.NavigateToTag("etsPreview");
         }
         catch (Exception ex) { await ShowErrorAsync(ex.Message); }
     }

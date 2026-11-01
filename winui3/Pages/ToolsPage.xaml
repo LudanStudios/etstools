@@ -115,7 +115,7 @@
                             <SymbolIcon Symbol="Play" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
                             <TextBlock Text="自动口语" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
                             <Border Style="{StaticResource BetaBadgeStyle}">
-                                <TextBlock Text="BETA" FontSize="10" FontWeight="SemiBold" Foreground="White"
+                                <TextBlock Text="BETA" FontSize="10" FontWeight="SemiBold" Foreground="#FF5B430F"
                                            HorizontalAlignment="Center" VerticalAlignment="Center" />
                             </Border>
                         </StackPanel>

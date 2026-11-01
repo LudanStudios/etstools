@@ -42,7 +42,7 @@ public sealed class SpeakingPrepService
         if (session.Items.Count != questions.Count) return null;
         if (!session.Items.Select(item => item.Number).SequenceEqual(questions.Select(question => question.Number)))
             return null;
-        return session.Items.All(item => !string.IsNullOrWhiteSpace(item.WavPath) && File.Exists(item.WavPath))
+        return session.Items.All(item => SpeakingSessionStore.IsUsableWavFile(item.WavPath))
             ? session
             : null;
     }

@@ -293,8 +293,7 @@ def main(argv: list[str] | None = None) -> int:
     while True:
         running = ets_is_running(ETS_EXE)
         if running and not was_running:
-            log("ETS process detected; opening the assistant window.")
-            start_assistant_window()
+            log("ETS process detected; starting automation workers.")
         if running and not was_running and (terminal is None or terminal.poll() is not None):
             log("ETS process detected; starting the converter watcher and answer worker.")
             try:
@@ -305,6 +304,12 @@ def main(argv: list[str] | None = None) -> int:
                 terminal = None
         if running and (worker is None or worker.poll() is not None):
             worker = start_auto_answer_worker()
+        if running and not was_running:
+            log("ETS process detected; opening the assistant window.")
+            try:
+                start_assistant_window()
+            except Exception as exc:
+                log(f"Could not open the assistant window: {exc}")
         if not running and was_running:
             stop_process(worker, "auto-answer listener")
             stop_process(terminal, "converter watcher", tree=True)
